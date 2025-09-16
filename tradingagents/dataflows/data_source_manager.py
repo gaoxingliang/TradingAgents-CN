@@ -47,6 +47,12 @@ class DataSourceManager:
 
     def _get_default_source(self) -> ChinaDataSource:
         """获取默认数据源"""
+        # 检查Tushare是否可用，如果可用则优先使用Tushare
+        tushare_token = os.getenv('TUSHARE_TOKEN')
+        if tushare_token and len(tushare_token) >= 30:
+            logger.info("🔍 检测到Tushare Token，优先使用Tushare数据源")
+            return ChinaDataSource.TUSHARE
+        
         # 从环境变量获取，默认使用AKShare作为第一优先级数据源
         env_source = os.getenv('DEFAULT_CHINA_DATA_SOURCE', 'akshare').lower()
 

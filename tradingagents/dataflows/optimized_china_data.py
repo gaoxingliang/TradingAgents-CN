@@ -458,11 +458,19 @@ class OptimizedChinaDataProvider:
     def _estimate_financial_metrics(self, symbol: str, current_price: str) -> dict:
         """获取真实财务指标（优先使用Tushare真实数据，失败时使用估算）"""
 
-        # 提取价格数值
-        try:
-            price_value = float(current_price.replace('¥', '').replace(',', ''))
-        except:
-            price_value = 10.0  # 默认值
+        # 提取价格数值 - 改进价格解析逻辑
+        price_value = self._parse_stock_price(current_price)
+        
+        if price_value is None:
+            logger.error(f"❌ 无法解析股票价格: {current_price}，跳过PE/PB计算")
+            # 返回不包含PE/PB的估算数据
+            estimated_metrics = self._get_estimated_financial_metrics(symbol, None)
+            estimated_metrics.update({
+                "pe": "价格解析失败",
+                "pb": "价格解析失败",
+                "data_source": "价格解析失败"
+            })
+            return estimated_metrics
 
         # 尝试获取真实财务数据
         real_metrics = self._get_real_financial_metrics(symbol, price_value)
@@ -482,50 +490,104 @@ class OptimizedChinaDataProvider:
         
         return estimated_metrics
 
-    def _get_real_financial_metrics(self, symbol: str, price_value: float) -> dict:
-        """获取真实财务指标 - 优先使用AKShare"""
+    def _parse_stock_price(self, current_price: str) -> float:
+        """解析股票价格，支持多种格式"""
+        if not current_price or current_price.strip() == "":
+            logger.warning("⚠️ 股票价格为空")
+            return None
+            
         try:
-            # 优先尝试AKShare数据源
-            logger.info(f"🔄 优先尝试AKShare获取{symbol}财务数据")
-            from .akshare_utils import get_akshare_provider
+            # 清理价格字符串
+            price_str = current_price.strip()
             
-            akshare_provider = get_akshare_provider()
+            # 移除常见的前缀和后缀
+            price_str = price_str.replace('¥', '').replace('$', '').replace('€', '').replace('£', '')
+            price_str = price_str.replace(',', '').replace(' ', '')
             
-            if akshare_provider.connected:
-                financial_data = akshare_provider.get_financial_data(symbol)
-                
-                if financial_data and any(not v.empty if hasattr(v, 'empty') else bool(v) for v in financial_data.values()):
-                    logger.info(f"✅ AKShare财务数据获取成功: {symbol}")
-                    # 获取股票基本信息
-                    stock_info = akshare_provider.get_stock_info(symbol)
-                    
-                    # 解析AKShare财务数据
-                    logger.debug(f"🔧 调用AKShare解析函数，股价: {price_value}")
-                    metrics = self._parse_akshare_financial_data(financial_data, stock_info, price_value)
-                    logger.debug(f"🔧 AKShare解析结果: {metrics}")
-                    if metrics:
-                        logger.info(f"✅ AKShare解析成功，返回指标")
-                        return metrics
-                    else:
-                        logger.warning(f"⚠️ AKShare解析失败，返回None")
-                else:
-                    logger.warning(f"⚠️ AKShare未获取到{symbol}财务数据，尝试Tushare")
+            # 处理中文数字
+            if '万' in price_str:
+                price_str = price_str.replace('万', '')
+                multiplier = 10000
+            elif '千' in price_str:
+                price_str = price_str.replace('千', '')
+                multiplier = 1000
             else:
-                logger.warning(f"⚠️ AKShare未连接，尝试Tushare")
+                multiplier = 1
             
-            # 备用方案：使用Tushare数据源
-            logger.info(f"🔄 使用Tushare备用数据源获取{symbol}财务数据")
+            # 转换为浮点数
+            price_value = float(price_str) * multiplier
+            
+            # 验证价格合理性
+            if price_value <= 0:
+                logger.warning(f"⚠️ 股票价格无效: {price_value}")
+                return None
+            elif price_value > 100000:  # 超过10万的股票价格可能有问题
+                logger.warning(f"⚠️ 股票价格异常高: {price_value}")
+                return None
+            elif price_value < 0.01:  # 低于1分的股票价格可能有问题
+                logger.warning(f"⚠️ 股票价格异常低: {price_value}")
+                return None
+            
+            logger.debug(f"✅ 成功解析股票价格: {current_price} -> {price_value}")
+            return price_value
+            
+        except (ValueError, TypeError) as e:
+            logger.error(f"❌ 股票价格解析失败: {current_price}, 错误: {e}")
+            return None
+
+    def _get_real_financial_metrics(self, symbol: str, price_value: float) -> dict:
+        """获取真实财务指标 - 根据配置选择数据源优先级"""
+        try:
+            # 检查用户配置的数据源优先级
+            from .data_source_manager import DataSourceManager
+            data_source_manager = DataSourceManager()
+            preferred_source = data_source_manager.default_source
+            
+            # 根据配置选择数据源优先级
+            if preferred_source.value == 'tushare':
+                # 用户配置了Tushare优先，先尝试Tushare
+                logger.info(f"🔄 用户配置Tushare优先，尝试Tushare获取{symbol}财务数据")
+                tushare_metrics = self._try_tushare_financial_data(symbol, price_value)
+                if tushare_metrics:
+                    return tushare_metrics
+                
+                # Tushare失败，尝试AKShare作为备用
+                logger.info(f"🔄 Tushare失败，尝试AKShare备用数据源获取{symbol}财务数据")
+                akshare_metrics = self._try_akshare_financial_data(symbol, price_value)
+                if akshare_metrics:
+                    return akshare_metrics
+            else:
+                # 默认或用户配置AKShare优先，先尝试AKShare
+                logger.info(f"🔄 默认或用户配置AKShare优先，尝试AKShare获取{symbol}财务数据")
+                akshare_metrics = self._try_akshare_financial_data(symbol, price_value)
+                if akshare_metrics:
+                    return akshare_metrics
+                
+                # AKShare失败，尝试Tushare作为备用
+                logger.info(f"🔄 AKShare失败，尝试Tushare备用数据源获取{symbol}财务数据")
+                tushare_metrics = self._try_tushare_financial_data(symbol, price_value)
+                if tushare_metrics:
+                    return tushare_metrics
+                
+        except Exception as e:
+            logger.debug(f"获取{symbol}真实财务数据失败: {e}")
+        
+        return None
+
+    def _try_tushare_financial_data(self, symbol: str, price_value: float) -> dict:
+        """尝试使用Tushare获取财务数据"""
+        try:
             from .tushare_utils import get_tushare_provider
             
             provider = get_tushare_provider()
             if not provider.connected:
-                logger.debug(f"Tushare未连接，无法获取{symbol}真实财务数据")
+                logger.debug(f"Tushare未连接，无法获取{symbol}财务数据")
                 return None
             
             # 获取财务数据
             financial_data = provider.get_financial_data(symbol)
             if not financial_data:
-                logger.debug(f"未获取到{symbol}的财务数据")
+                logger.debug(f"Tushare未获取到{symbol}的财务数据")
                 return None
             
             # 获取股票基本信息
@@ -534,12 +596,51 @@ class OptimizedChinaDataProvider:
             # 解析Tushare财务数据
             metrics = self._parse_financial_data(financial_data, stock_info, price_value)
             if metrics:
+                logger.info(f"✅ Tushare财务数据解析成功: {symbol}")
                 return metrics
+            else:
+                logger.warning(f"⚠️ Tushare财务数据解析失败: {symbol}")
+                return None
                 
         except Exception as e:
-            logger.debug(f"获取{symbol}真实财务数据失败: {e}")
-        
-        return None
+            logger.debug(f"Tushare获取{symbol}财务数据失败: {e}")
+            return None
+
+    def _try_akshare_financial_data(self, symbol: str, price_value: float) -> dict:
+        """尝试使用AKShare获取财务数据"""
+        try:
+            from .akshare_utils import get_akshare_provider
+            
+            akshare_provider = get_akshare_provider()
+            
+            if not akshare_provider.connected:
+                logger.debug(f"AKShare未连接，无法获取{symbol}财务数据")
+                return None
+            
+            financial_data = akshare_provider.get_financial_data(symbol)
+            
+            if not financial_data or not any(not v.empty if hasattr(v, 'empty') else bool(v) for v in financial_data.values()):
+                logger.debug(f"AKShare未获取到{symbol}财务数据")
+                return None
+            
+            logger.info(f"✅ AKShare财务数据获取成功: {symbol}")
+            # 获取股票基本信息
+            stock_info = akshare_provider.get_stock_info(symbol)
+            
+            # 解析AKShare财务数据
+            logger.debug(f"🔧 调用AKShare解析函数，股价: {price_value}")
+            metrics = self._parse_akshare_financial_data(financial_data, stock_info, price_value)
+            logger.debug(f"🔧 AKShare解析结果: {metrics}")
+            if metrics:
+                logger.info(f"✅ AKShare解析成功，返回指标")
+                return metrics
+            else:
+                logger.warning(f"⚠️ AKShare解析失败，返回None")
+                return None
+                
+        except Exception as e:
+            logger.debug(f"AKShare获取{symbol}财务数据失败: {e}")
+            return None
 
     def _parse_akshare_financial_data(self, financial_data: dict, stock_info: dict, price_value: float) -> dict:
         """解析AKShare财务数据为指标"""
@@ -930,6 +1031,64 @@ class OptimizedChinaDataProvider:
 
     def _get_estimated_financial_metrics(self, symbol: str, price_value: float) -> dict:
         """获取估算财务指标（原有的分类方法）"""
+        # 如果价格解析失败，返回不包含PE/PB的估算数据
+        if price_value is None:
+            base_metrics = {
+                "ps": "2.5倍",
+                "dividend_yield": "2.5%",
+                "roe": "12.8%",
+                "roa": "6.5%",
+                "gross_margin": "35.2%",
+                "net_margin": "15.8%",
+                "debt_ratio": "45%",
+                "current_ratio": "1.8倍",
+                "quick_ratio": "1.5倍",
+                "cash_ratio": "良好",
+                "fundamental_score": 7.0,
+                "valuation_score": 6.0,
+                "growth_score": 7.0,
+                "risk_level": "中等",
+                "data_source": "估算值（价格解析失败）"
+            }
+            
+            # 根据股票类型调整
+            if symbol.startswith(('000001', '600036')):  # 银行股
+                base_metrics.update({
+                    "ps": "2.1倍",
+                    "dividend_yield": "4.2%",
+                    "roe": "12.5%",
+                    "roa": "0.95%",
+                    "gross_margin": "N/A（银行业无毛利率概念）",
+                    "net_margin": "28.5%",
+                    "debt_ratio": "92%",
+                    "current_ratio": "N/A（银行业特殊）",
+                    "quick_ratio": "N/A（银行业特殊）",
+                    "cash_ratio": "充足",
+                    "fundamental_score": 7.5,
+                    "valuation_score": 8.0,
+                    "growth_score": 6.5,
+                    "risk_level": "中等"
+                })
+            elif symbol.startswith('300'):  # 创业板
+                base_metrics.update({
+                    "ps": "5.8倍",
+                    "dividend_yield": "1.2%",
+                    "roe": "15.2%",
+                    "roa": "8.5%",
+                    "gross_margin": "42.5%",
+                    "net_margin": "18.2%",
+                    "debt_ratio": "35%",
+                    "current_ratio": "2.1倍",
+                    "quick_ratio": "1.8倍",
+                    "cash_ratio": "良好",
+                    "fundamental_score": 7.0,
+                    "valuation_score": 5.5,
+                    "growth_score": 8.5,
+                    "risk_level": "较高"
+                })
+            
+            return base_metrics
+        
         # 根据股票代码和价格估算指标
         if symbol.startswith(('000001', '600036')):  # 银行股
             return {
