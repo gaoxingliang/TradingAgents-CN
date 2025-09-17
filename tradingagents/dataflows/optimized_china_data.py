@@ -214,22 +214,41 @@ class OptimizedChinaDataProvider:
                     if "股票名称:" in line:
                         company_name = line.split(':')[1].strip()
                         logger.debug(f"🔍 [股票代码追踪] 从统一接口获取到股票名称: {company_name}")
-                        break
+                    elif "当前价格:" in line:
+                        current_price = line.split(':')[1].strip()
+                        logger.debug(f"🔍 [价格追踪] 从统一接口获取到当前价格: {current_price}")
+                    elif "涨跌幅:" in line:
+                        change_pct = line.split(':')[1].strip()
+                        logger.debug(f"🔍 [价格追踪] 从统一接口获取到涨跌幅: {change_pct}")
+                    elif "成交量:" in line:
+                        volume = line.split(':')[1].strip()
+                        logger.debug(f"🔍 [价格追踪] 从统一接口获取到成交量: {volume}")
         except Exception as e:
             logger.warning(f"⚠️ 获取股票基本信息失败: {e}")
 
         # 然后从股票数据中提取价格信息
+        logger.debug(f"🔍 [价格追踪] 开始从股票数据提取价格信息，数据长度: {len(stock_data) if stock_data else 0}")
+        logger.debug(f"🔍 [价格追踪] 股票数据前500字符: {stock_data[:500] if stock_data else 'None'}")
+        
         if "股票名称:" in stock_data:
             lines = stock_data.split('\n')
-            for line in lines:
+            logger.debug(f"🔍 [价格追踪] 股票数据行数: {len(lines)}")
+            for i, line in enumerate(lines):
+                logger.debug(f"🔍 [价格追踪] 第{i}行: {line}")
                 if "股票名称:" in line and company_name == "未知公司":
                     company_name = line.split(':')[1].strip()
+                    logger.debug(f"🔍 [价格追踪] 提取到股票名称: {company_name}")
                 elif "当前价格:" in line:
                     current_price = line.split(':')[1].strip()
+                    logger.debug(f"🔍 [价格追踪] 提取到当前价格: {current_price}")
                 elif "涨跌幅:" in line:
                     change_pct = line.split(':')[1].strip()
+                    logger.debug(f"🔍 [价格追踪] 提取到涨跌幅: {change_pct}")
                 elif "成交量:" in line:
                     volume = line.split(':')[1].strip()
+                    logger.debug(f"🔍 [价格追踪] 提取到成交量: {volume}")
+        else:
+            logger.debug(f"🔍 [价格追踪] 股票数据中未找到'股票名称:'标识")
 
         # 尝试从股票数据表格中提取最新价格信息
         if current_price == "N/A" and stock_data:
@@ -254,6 +273,32 @@ class OptimizedChinaDataProvider:
                         break
             except Exception as e:
                 logger.debug(f"🔍 [股票代码追踪] 解析股票数据表格失败: {e}")
+        
+        # 如果价格仍然是N/A，尝试使用备用价格获取
+        if current_price == "N/A":
+            logger.debug(f"🔍 [价格追踪] 价格仍为N/A，尝试使用备用价格获取")
+            fallback_price = self._get_fallback_price(symbol)
+            if fallback_price is not None:
+                current_price = str(fallback_price)
+                logger.debug(f"🔍 [价格追踪] 备用价格获取成功: {current_price}")
+            else:
+                logger.debug(f"🔍 [价格追踪] 备用价格获取也失败")
+        
+        # 如果涨跌幅或成交量仍然是N/A，尝试获取实时行情数据
+        if change_pct == "N/A" or volume == "N/A":
+            logger.debug(f"🔍 [行情追踪] 尝试获取实时行情数据")
+            realtime_data = self._get_realtime_market_data(symbol)
+            if realtime_data:
+                if change_pct == "N/A" and realtime_data.get('change_pct'):
+                    change_pct = realtime_data['change_pct']
+                    logger.debug(f"🔍 [行情追踪] 获取到涨跌幅: {change_pct}")
+                if volume == "N/A" and realtime_data.get('volume'):
+                    volume = realtime_data['volume']
+                    logger.debug(f"🔍 [行情追踪] 获取到成交量: {volume}")
+        
+        logger.debug(f"🔍 [价格追踪] 最终价格: {current_price}")
+        logger.debug(f"🔍 [行情追踪] 最终涨跌幅: {change_pct}")
+        logger.debug(f"🔍 [行情追踪] 最终成交量: {volume}")
 
         # 根据股票代码判断行业和基本信息
         logger.debug(f"🔍 [股票代码追踪] 调用 _get_industry_info，传入参数: '{symbol}'")
@@ -461,16 +506,23 @@ class OptimizedChinaDataProvider:
         # 提取价格数值 - 改进价格解析逻辑
         price_value = self._parse_stock_price(current_price)
         
+        # 如果价格解析失败，尝试从其他数据源获取价格
         if price_value is None:
-            logger.error(f"❌ 无法解析股票价格: {current_price}，跳过PE/PB计算")
-            # 返回不包含PE/PB的估算数据
-            estimated_metrics = self._get_estimated_financial_metrics(symbol, None)
-            estimated_metrics.update({
-                "pe": "价格解析失败",
-                "pb": "价格解析失败",
-                "data_source": "价格解析失败"
-            })
-            return estimated_metrics
+            logger.warning(f"⚠️ 无法解析股票价格: {current_price}，尝试获取实时价格")
+            price_value = self._get_fallback_price(symbol)
+            
+            if price_value is None:
+                logger.error(f"❌ 所有价格获取方式都失败，跳过PE/PB计算")
+                # 返回不包含PE/PB的估算数据
+                estimated_metrics = self._get_estimated_financial_metrics(symbol, None)
+                estimated_metrics.update({
+                    "pe": "价格获取失败",
+                    "pb": "价格获取失败",
+                    "data_source": "价格获取失败"
+                })
+                return estimated_metrics
+            else:
+                logger.info(f"✅ 使用备用价格获取方式成功: {price_value}")
 
         # 尝试获取真实财务数据
         real_metrics = self._get_real_financial_metrics(symbol, price_value)
@@ -500,9 +552,15 @@ class OptimizedChinaDataProvider:
             # 清理价格字符串
             price_str = current_price.strip()
             
+            # 检查无效值
+            if price_str.upper() in ['N/A', 'NA', 'NULL', 'NONE', '--', '-', '未知', '待定']:
+                logger.warning(f"⚠️ 股票价格为无效值: {current_price}")
+                return None
+            
             # 移除常见的前缀和后缀
             price_str = price_str.replace('¥', '').replace('$', '').replace('€', '').replace('£', '')
             price_str = price_str.replace(',', '').replace(' ', '')
+            price_str = price_str.replace('元', '')
             
             # 处理中文数字
             if '万' in price_str:
@@ -533,6 +591,146 @@ class OptimizedChinaDataProvider:
             
         except (ValueError, TypeError) as e:
             logger.error(f"❌ 股票价格解析失败: {current_price}, 错误: {e}")
+            return None
+
+    def _get_fallback_price(self, symbol: str) -> float:
+        """备用价格获取方法，当主要价格解析失败时使用"""
+        try:
+            logger.info(f"🔄 尝试使用AKShare获取{symbol}的实时价格")
+            
+            # 方法1: 尝试获取股票基本信息中的最新价格
+            try:
+                import akshare as ak
+                stock_info = ak.stock_individual_info_em(symbol=symbol)
+                if stock_info is not None and not stock_info.empty:
+                    # 查找最新价格
+                    for _, row in stock_info.iterrows():
+                        if row['item'] == '最新':
+                            price_str = str(row['value'])
+                            price_value = self._parse_stock_price(price_str)
+                            if price_value is not None:
+                                logger.info(f"✅ 从股票基本信息获取价格成功: {price_value}")
+                                return price_value
+            except Exception as e:
+                logger.debug(f"从股票基本信息获取价格失败: {e}")
+            
+            # 方法2: 尝试获取实时行情数据
+            try:
+                import akshare as ak
+                realtime_data = ak.stock_zh_a_spot_em()
+                if realtime_data is not None and not realtime_data.empty:
+                    stock_data = realtime_data[realtime_data['代码'] == symbol]
+                    if not stock_data.empty:
+                        latest_price = stock_data.iloc[0]['最新价']
+                        price_value = self._parse_stock_price(str(latest_price))
+                        if price_value is not None:
+                            logger.info(f"✅ 从实时行情获取价格成功: {price_value}")
+                            return price_value
+            except Exception as e:
+                logger.debug(f"从实时行情获取价格失败: {e}")
+            
+            # 方法3: 尝试获取历史数据的最新收盘价
+            try:
+                import akshare as ak
+                from datetime import datetime, timedelta
+                
+                end_date = datetime.now().strftime('%Y%m%d')
+                start_date = (datetime.now() - timedelta(days=5)).strftime('%Y%m%d')
+                
+                hist_data = ak.stock_zh_a_hist(symbol=symbol, period="daily", 
+                                              start_date=start_date, end_date=end_date, adjust="")
+                if hist_data is not None and not hist_data.empty:
+                    latest_price = hist_data.iloc[-1]['收盘']
+                    price_value = self._parse_stock_price(str(latest_price))
+                    if price_value is not None:
+                        logger.info(f"✅ 从历史数据获取价格成功: {price_value}")
+                        return price_value
+            except Exception as e:
+                logger.debug(f"从历史数据获取价格失败: {e}")
+            
+            logger.warning(f"⚠️ 所有备用价格获取方式都失败: {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 备用价格获取过程中出现错误: {e}")
+            return None
+
+    def _get_realtime_market_data(self, symbol: str) -> dict:
+        """获取实时行情数据，包括涨跌幅和成交量"""
+        try:
+            logger.info(f"🔄 尝试获取{symbol}的实时行情数据")
+            
+            # 方法1: 尝试从AKShare获取实时行情
+            try:
+                import akshare as ak
+                realtime_data = ak.stock_zh_a_spot_em()
+                if realtime_data is not None and not realtime_data.empty:
+                    stock_data = realtime_data[realtime_data['代码'] == symbol]
+                    if not stock_data.empty:
+                        latest_data = stock_data.iloc[0]
+                        
+                        # 提取涨跌幅
+                        change_pct = latest_data.get('涨跌幅', 'N/A')
+                        if change_pct != 'N/A' and change_pct is not None:
+                            change_pct = f"{change_pct:.2f}%"
+                        
+                        # 提取成交量
+                        volume = latest_data.get('成交量', 'N/A')
+                        if volume != 'N/A' and volume is not None:
+                            # 格式化成交量（转换为万手）
+                            try:
+                                volume_num = float(volume)
+                                if volume_num >= 10000:
+                                    volume = f"{volume_num/10000:.2f}万手"
+                                else:
+                                    volume = f"{volume_num:.0f}手"
+                            except (ValueError, TypeError):
+                                volume = str(volume)
+                        
+                        result = {
+                            'change_pct': change_pct,
+                            'volume': volume
+                        }
+                        
+                        logger.info(f"✅ 从实时行情获取数据成功: 涨跌幅={change_pct}, 成交量={volume}")
+                        return result
+            except Exception as e:
+                logger.debug(f"从实时行情获取数据失败: {e}")
+            
+            # 方法2: 尝试从历史数据计算涨跌幅
+            try:
+                import akshare as ak
+                from datetime import datetime, timedelta
+                
+                end_date = datetime.now().strftime('%Y%m%d')
+                start_date = (datetime.now() - timedelta(days=5)).strftime('%Y%m%d')
+                
+                hist_data = ak.stock_zh_a_hist(symbol=symbol, period="daily", 
+                                              start_date=start_date, end_date=end_date, adjust="")
+                if hist_data is not None and len(hist_data) >= 2:
+                    latest_close = hist_data.iloc[-1]['收盘']
+                    prev_close = hist_data.iloc[-2]['收盘']
+                    
+                    if prev_close > 0:
+                        change = latest_close - prev_close
+                        change_pct = (change / prev_close) * 100
+                        change_pct = f"{change_pct:.2f}%"
+                        
+                        result = {
+                            'change_pct': change_pct,
+                            'volume': 'N/A'  # 历史数据中成交量格式可能不同
+                        }
+                        
+                        logger.info(f"✅ 从历史数据计算涨跌幅成功: {change_pct}")
+                        return result
+            except Exception as e:
+                logger.debug(f"从历史数据计算涨跌幅失败: {e}")
+            
+            logger.warning(f"⚠️ 所有实时行情获取方式都失败: {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 实时行情获取过程中出现错误: {e}")
             return None
 
     def _get_real_financial_metrics(self, symbol: str, price_value: float) -> dict:
